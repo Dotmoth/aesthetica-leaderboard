@@ -1,0 +1,14 @@
+# Render blueprint for the Aesthetica leaderboard (free web service).
+# DATABASE_URL is the Postgres address from Neon (free): set it in Render's
+# dashboard when it asks; it is never stored in this file.
+services:
+  - type: web
+    name: aesthetica-leaderboard
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false

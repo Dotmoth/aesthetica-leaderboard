@@ -1,0 +1,16 @@
+{
+  "name": "aesthetica-leaderboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Online leaderboard for Aesthetica",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "pg": "^8.11.3"
+  }
+}
