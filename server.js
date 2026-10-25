@@ -3,6 +3,8 @@
 //   GET  /scores?level=<id>&limit=20&name=<player>  -> { scores: [...], you: {...}|null }
 //   POST /scores  { level, name, token, time_ms }   -> { rank, best_ms, improved }
 //   GET  /rank?name=<player>                         -> { records, finished, players }
+//   POST /ghost   { level, name, token, time_ms, data } -> { ok }   (record holder only)
+//   GET  /ghost?level=<id>                          -> { name, time_ms, data }
 //   GET  /health                                    -> { ok: true }
 //
 // Each name is claimed by the first token that submits with it, so nobody else
@@ -30,6 +32,11 @@ const MAX_MS = 60 * 60 * 1000;
 const NAME_RE = /^[A-Za-z0-9 _-]{1,16}$/;
 
 let db = { players: {}, scores: {} }; // players: name -> token, scores: level -> { name: ms }
+// The run behind each level's record, for players to race: level -> { name, time_ms, data }.
+// Kept apart from the board: runs are much bigger than times.
+let ghosts = {};
+const GHOST_FILE = process.env.GHOST_FILE || path.join(__dirname, "ghosts.json");
+const GHOST_MAX = 800 * 1024;
 
 // Postgres: the whole board is one small JSON document in one row.
 const DATABASE_URL = process.env.DATABASE_URL || "";
@@ -41,6 +48,7 @@ async function load() {
     await pool.query("CREATE TABLE IF NOT EXISTS board (id int PRIMARY KEY, data jsonb NOT NULL)");
     const r = await pool.query("SELECT data FROM board WHERE id = 1");
     if (r.rows.length) db = r.rows[0].data;
+    await pool.query("CREATE TABLE IF NOT EXISTS ghosts (level text PRIMARY KEY, name text NOT NULL, time_ms int NOT NULL, data text NOT NULL)");
     return "postgres";
   }
   try {
@@ -48,7 +56,33 @@ async function load() {
   } catch {
     /* first run */
   }
+  try {
+    ghosts = JSON.parse(fs.readFileSync(GHOST_FILE, "utf8"));
+  } catch {
+    /* none yet */
+  }
   return DATA_FILE;
+}
+
+async function saveGhost(level, g) {
+  if (pool) {
+    await pool.query(
+      "INSERT INTO ghosts (level, name, time_ms, data) VALUES ($1, $2, $3, $4) " +
+        "ON CONFLICT (level) DO UPDATE SET name = EXCLUDED.name, time_ms = EXCLUDED.time_ms, data = EXCLUDED.data",
+      [level, g.name, g.time_ms, g.data]
+    );
+    return;
+  }
+  ghosts[level] = g;
+  fs.writeFileSync(GHOST_FILE, JSON.stringify(ghosts));
+}
+
+async function loadGhost(level) {
+  if (pool) {
+    const r = await pool.query("SELECT name, time_ms, data FROM ghosts WHERE level = $1", [level]);
+    return r.rows[0] || null;
+  }
+  return ghosts[level] || null;
 }
 
 let saveTimer = null;
@@ -116,6 +150,7 @@ const server = http.createServer((req, res) => {
     }
     return send(res, 200, { records, finished, players: Object.keys(db.players).length });
   }
+  if (url.pathname === "/ghost") return ghost(req, res, url);
   if (url.pathname !== "/scores") return send(res, 404, { error: "Not found" });
 
   if (req.method === "GET") {
@@ -168,6 +203,45 @@ const server = http.createServer((req, res) => {
   }
   send(res, 405, { error: "Method not allowed" });
 });
+
+// The record ghost: anyone can fetch it; only the current record holder, with
+// their token and exactly their record time, can replace it.
+function ghost(req, res, url) {
+  if (req.method === "GET") {
+    const level = url.searchParams.get("level") || "";
+    if (!validLevel(level)) return send(res, 400, { error: "Unknown level" });
+    loadGhost(level)
+      .then((g) => (g ? send(res, 200, g) : send(res, 404, { error: "No ghost yet" })))
+      .catch(() => send(res, 500, { error: "Could not load the ghost" }));
+    return;
+  }
+  if (req.method !== "POST") return send(res, 405, { error: "Method not allowed" });
+  let body = "";
+  req.on("data", (c) => {
+    body += c;
+    if (body.length > GHOST_MAX) req.destroy();
+  });
+  req.on("end", () => {
+    let p;
+    try {
+      p = JSON.parse(body);
+    } catch {
+      return send(res, 400, { error: "Bad JSON" });
+    }
+    const { level, name, token, data } = p;
+    const ms = Math.round(Number(p.time_ms));
+    if (!validLevel(level)) return send(res, 400, { error: "Unknown level" });
+    if (typeof data !== "string" || data.length < 16 || !/^[A-Za-z0-9+/=]+$/.test(data))
+      return send(res, 400, { error: "Bad ghost" });
+    if (db.players[name] !== token) return send(res, 403, { error: "Not your name" });
+    const top = ranked(level)[0];
+    if (!top || top.name !== name || top.time_ms !== ms) return send(res, 403, { error: "Only the record holder's run" });
+    if (limited(req.socket.remoteAddress)) return send(res, 429, { error: "Slow down" });
+    saveGhost(level, { name, time_ms: ms, data })
+      .then(() => send(res, 200, { ok: true }))
+      .catch(() => send(res, 500, { error: "Could not save the ghost" }));
+  });
+}
 
 load()
   .then((where) => server.listen(PORT, () => console.log(`Aesthetica leaderboard on :${PORT} (${where})`)))
