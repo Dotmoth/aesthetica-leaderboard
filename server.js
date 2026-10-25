@@ -27,9 +27,10 @@ const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, "scores.json");
 const LEVEL_RE = /^[a-z0-9_]{3,40}$/;
 const LEVEL_LIST = process.env.LEVELS ? new Set(process.env.LEVELS.split(",")) : null;
 const validLevel = (id) => typeof id === "string" && (LEVEL_LIST ? LEVEL_LIST.has(id) : LEVEL_RE.test(id));
-const MIN_MS = 3000;
+const MIN_MS = 500; // some levels really are done in under 3 s
 const MAX_MS = 60 * 60 * 1000;
-const NAME_RE = /^[A-Za-z0-9 _-]{1,16}$/;
+// Letters from any language (é, ç, ß...), digits, spaces and _ . - ; up to 16.
+const NAME_RE = /^[\p{L}\p{N} _.-]{1,16}$/u;
 
 let db = { players: {}, scores: {} }; // players: name -> token, scores: level -> { name: ms }
 // The run behind each level's record, for players to race: level -> { name, time_ms, data }.
