@@ -137,7 +137,8 @@ function send(res, code, obj) {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://x");
   if (req.method === "OPTIONS") return send(res, 204, {});
-  if (url.pathname === "/health") return send(res, 200, { ok: true });
+  // storage: "postgres" (kept for good) or "file" (lost when a free host restarts).
+  if (url.pathname === "/health") return send(res, 200, { ok: true, storage: pool ? "postgres" : "file" });
   if (url.pathname === "/rank" && req.method === "GET") {
     // Records: levels where this name holds the best time. Finished: levels with any time.
     const name = url.searchParams.get("name") || "";
