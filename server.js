@@ -2,6 +2,7 @@
 //
 //   GET  /scores?level=<id>&limit=20&name=<player>  -> { scores: [...], you: {...}|null }
 //   POST /scores  { level, name, token, time_ms }   -> { rank, best_ms, improved }
+//   POST /sync    { name, token, times: {level: ms} } -> { results: {level: {rank, best_ms, improved}} }
 //   GET  /rank?name=<player>                         -> { records, finished, players }
 //   POST /ghost   { level, name, token, time_ms, data } -> { ok }   (record holder only)
 //   GET  /ghost?level=<id>                          -> { name, time_ms, data }
@@ -107,14 +108,35 @@ function save() {
   }, 500);
 }
 
-// Crude rate limit: 30 writes per minute per IP.
+// Crude rate limit: 60 writes per minute per player (by token: behind a host's
+// proxy every request arrives from the same address, so addresses mean nothing).
 const hits = new Map();
-function limited(ip) {
+function limited(key) {
   const now = Date.now();
-  const h = (hits.get(ip) || []).filter((t) => now - t < 60000);
+  const h = (hits.get(key) || []).filter((t) => now - t < 60000);
   h.push(now);
-  hits.set(ip, h);
-  return h.length > 30;
+  hits.set(key, h);
+  return h.length > 60;
+}
+
+// Checks a player's name and token; claims the name for the token if free.
+// Returns an error message, or "" when fine.
+function claim(name, token) {
+  if (typeof name !== "string" || !NAME_RE.test(name)) return "Bad name";
+  if (typeof token !== "string" || token.length < 16 || token.length > 64) return "Bad token";
+  const owner = db.players[name];
+  if (owner && owner !== token) return "That name is taken";
+  db.players[name] = token;
+  return "";
+}
+
+// Records one time; returns { rank, best_ms, improved }.
+function record(level, name, ms) {
+  const board = (db.scores[level] ||= {});
+  const prev = board[name];
+  const improved = prev === undefined || ms < prev;
+  if (improved) board[name] = ms;
+  return { rank: ranked(level).find((x) => x.name === name).rank, best_ms: board[name], improved };
 }
 
 function ranked(level) {
@@ -153,6 +175,7 @@ const server = http.createServer((req, res) => {
     return send(res, 200, { records, finished, players: Object.keys(db.players).length });
   }
   if (url.pathname === "/ghost") return ghost(req, res, url);
+  if (url.pathname === "/sync" && req.method === "POST") return sync(req, res);
   if (url.pathname !== "/scores") return send(res, 404, { error: "Not found" });
 
   if (req.method === "GET") {
@@ -181,30 +204,51 @@ const server = http.createServer((req, res) => {
       const { level, name, token } = p;
       const ms = Math.round(Number(p.time_ms));
       if (!validLevel(level)) return send(res, 400, { error: "Unknown level" });
-      if (typeof name !== "string" || !NAME_RE.test(name)) return send(res, 400, { error: "Bad name" });
-      if (typeof token !== "string" || token.length < 16 || token.length > 64)
-        return send(res, 400, { error: "Bad token" });
       if (!Number.isFinite(ms) || ms < MIN_MS || ms > MAX_MS) return send(res, 400, { error: "Bad time" });
-      if (limited(req.socket.remoteAddress)) return send(res, 429, { error: "Slow down" });
-
-      const owner = db.players[name];
-      if (owner && owner !== token) return send(res, 403, { error: "That name is taken" });
-      db.players[name] = token;
-
-      const board = (db.scores[level] ||= {});
-      const prev = board[name];
-      const improved = prev === undefined || ms < prev;
-      if (improved) {
-        board[name] = ms;
-        save();
-      }
-      const rank = ranked(level).find((s) => s.name === name).rank;
-      return send(res, 200, { rank, best_ms: board[name], improved });
+      if (limited(String(token))) return send(res, 429, { error: "Slow down" });
+      const err = claim(name, token);
+      if (err) return send(res, err === "That name is taken" ? 403 : 400, { error: err });
+      const r = record(level, name, ms);
+      if (r.improved) save();
+      return send(res, 200, r);
     });
     return;
   }
   send(res, 405, { error: "Method not allowed" });
 });
+
+// Every best time of one player in one request (the game sends them all at
+// startup, so the board gets back anything it lost). Counts as one write.
+function sync(req, res) {
+  let body = "";
+  req.on("data", (c) => {
+    body += c;
+    if (body.length > 64 * 1024) req.destroy();
+  });
+  req.on("end", () => {
+    let p;
+    try {
+      p = JSON.parse(body);
+    } catch {
+      return send(res, 400, { error: "Bad JSON" });
+    }
+    const { name, token, times } = p;
+    if (typeof times !== "object" || times === null) return send(res, 400, { error: "Bad times" });
+    if (limited(String(token))) return send(res, 429, { error: "Slow down" });
+    const err = claim(name, token);
+    if (err) return send(res, err === "That name is taken" ? 403 : 400, { error: err });
+    const results = {};
+    let changed = false;
+    for (const [level, t] of Object.entries(times).slice(0, 500)) {
+      const ms = Math.round(Number(t));
+      if (!validLevel(level) || !Number.isFinite(ms) || ms < MIN_MS || ms > MAX_MS) continue;
+      results[level] = record(level, name, ms);
+      changed ||= results[level].improved;
+    }
+    if (changed) save();
+    send(res, 200, { results });
+  });
+}
 
 // The record ghost: anyone can fetch it; only the current record holder, with
 // their token and exactly their record time, can replace it.
@@ -238,7 +282,7 @@ function ghost(req, res, url) {
     if (db.players[name] !== token) return send(res, 403, { error: "Not your name" });
     const top = ranked(level)[0];
     if (!top || top.name !== name || top.time_ms !== ms) return send(res, 403, { error: "Only the record holder's run" });
-    if (limited(req.socket.remoteAddress)) return send(res, 429, { error: "Slow down" });
+    if (limited(String(token))) return send(res, 429, { error: "Slow down" });
     saveGhost(level, { name, time_ms: ms, data })
       .then(() => send(res, 200, { ok: true }))
       .catch(() => send(res, 500, { error: "Could not save the ghost" }));
