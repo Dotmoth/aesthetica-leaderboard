@@ -3,7 +3,10 @@
 //   GET  /scores?level=<id>&limit=20&name=<player>  -> { scores: [...], you: {...}|null }
 //   POST /scores  { level, name, token, time_ms }   -> { rank, best_ms, improved }
 //   POST /sync    { name, token, times: {level: ms} } -> { results: {level: {rank, best_ms, improved}} }
-//   GET  /rank?name=<player>                         -> { records, finished, players }
+//   GET  /rank?name=<player>                         -> { records, finished, players, continent, place, of, top_pct }
+//   POST /account { action: "register", name, password, continent, token } -> { name, token, continent }
+//   POST /account { action: "login", name, password }                      -> { name, token, continent }
+//   POST /account { action: "continent", name, token, continent }          -> { name, token, continent }
 //   POST /ghost   { level, name, token, time_ms, data } -> { ok }   (record holder only)
 //   GET  /ghost?level=<id>                          -> { name, time_ms, data }
 //   GET  /health                                    -> { ok: true }
@@ -20,6 +23,7 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const PORT = Number(process.env.PORT || 8787);
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, "scores.json");
@@ -119,6 +123,21 @@ function limited(key) {
   return h.length > 60;
 }
 
+// Accounts: name (any letter case is the same name) -> password hash, the
+// player's token (what their times are filed under) and continent.
+const CONTINENTS = ["AF", "AS", "EU", "NA", "SA", "OC"];
+const accounts = () => (db.accounts ||= {});
+const hashOf = (password, salt) => crypto.scryptSync(String(password), salt, 32).toString("hex");
+
+// Another player's name that differs only in letter case ("" if none).
+function caseTwin(name, token) {
+  const low = name.toLowerCase();
+  const acc = accounts()[low];
+  if (acc && acc.token !== token) return acc.name;
+  for (const [n, t] of Object.entries(db.players)) if (n !== name && t !== token && n.toLowerCase() === low) return n;
+  return "";
+}
+
 // Checks a player's name and token; claims the name for the token if free.
 // Returns an error message, or "" when fine.
 function claim(name, token) {
@@ -126,8 +145,92 @@ function claim(name, token) {
   if (typeof token !== "string" || token.length < 16 || token.length > 64) return "Bad token";
   const owner = db.players[name];
   if (owner && owner !== token) return "That name is taken";
+  if (caseTwin(name, token)) return "That name is taken";
   db.players[name] = token;
   return "";
+}
+
+// Where a player stands among the players of their continent (everyone, if
+// they have none): the average of their placement on every level they have a
+// time on (0 = first, 1 = last), compared with everyone else's average.
+function standing(name) {
+  const acc = accounts()[name.toLowerCase()];
+  const cont = acc && acc.name === name ? acc.continent : "";
+  const inCont = (n) => {
+    if (!cont) return true;
+    const a = accounts()[n.toLowerCase()];
+    return !!a && a.name === n && a.continent === cont;
+  };
+  const sums = {};
+  for (const level of Object.keys(db.scores)) {
+    const list = ranked(level).filter((s) => inCont(s.name));
+    const n = list.length;
+    list.forEach((s, i) => {
+      const e = (sums[s.name] ||= [0, 0]);
+      e[0] += n > 1 ? i / (n - 1) : 0;
+      e[1]++;
+    });
+  }
+  const avgs = Object.entries(sums)
+    .map(([n, [s, c]]) => ({ name: n, avg: s / c, count: c }))
+    .sort((a, b) => a.avg - b.avg || b.count - a.count);
+  const i = avgs.findIndex((x) => x.name === name);
+  return {
+    continent: cont,
+    place: i + 1,
+    of: avgs.length,
+    top_pct: i < 0 ? null : i === 0 ? 1 : Math.max(1, Math.round(((i + 1) / avgs.length) * 100)),
+  };
+}
+
+function account(req, res) {
+  let body = "";
+  req.on("data", (c) => {
+    body += c;
+    if (body.length > 4096) req.destroy();
+  });
+  req.on("end", () => {
+    let p;
+    try {
+      p = JSON.parse(body);
+    } catch {
+      return send(res, 400, { error: "Bad JSON" });
+    }
+    const { action, name, password, token, continent } = p;
+    if (typeof name !== "string" || !NAME_RE.test(name)) return send(res, 400, { error: "Bad name" });
+    if (limited("acc:" + name.toLowerCase())) return send(res, 429, { error: "Slow down" });
+    const low = name.toLowerCase();
+    const acc = accounts()[low];
+    const reply = (a) => send(res, 200, { name: a.name, token: a.token, continent: a.continent });
+    if (action === "register") {
+      if (typeof password !== "string" || password.length < 6 || password.length > 72)
+        return send(res, 400, { error: "Password: 6 to 72 characters" });
+      if (!CONTINENTS.includes(continent)) return send(res, 400, { error: "Pick a continent" });
+      if (acc) return send(res, 403, { error: "That name is taken" });
+      // Your current name (and its times) become the account, if they are yours.
+      const err = claim(name, token);
+      if (err) return send(res, err === "That name is taken" ? 403 : 400, { error: err });
+      const salt = crypto.randomBytes(16).toString("hex");
+      accounts()[low] = { name, salt, hash: hashOf(password, salt), token, continent };
+      save();
+      return reply(accounts()[low]);
+    }
+    if (action === "login") {
+      const ok =
+        acc && typeof password === "string" &&
+        crypto.timingSafeEqual(Buffer.from(hashOf(password, acc.salt), "hex"), Buffer.from(acc.hash, "hex"));
+      if (!ok) return send(res, 403, { error: "Wrong name or password" });
+      return reply(acc);
+    }
+    if (action === "continent") {
+      if (!acc || acc.token !== token) return send(res, 403, { error: "Not your account" });
+      if (!CONTINENTS.includes(continent)) return send(res, 400, { error: "Pick a continent" });
+      acc.continent = continent;
+      save();
+      return reply(acc);
+    }
+    return send(res, 400, { error: "Unknown action" });
+  });
 }
 
 // Records one time; returns { rank, best_ms, improved }.
@@ -172,10 +275,11 @@ const server = http.createServer((req, res) => {
       finished++;
       if (ranked(level)[0].name === name) records++;
     }
-    return send(res, 200, { records, finished, players: Object.keys(db.players).length });
+    return send(res, 200, { records, finished, players: Object.keys(db.players).length, ...standing(name) });
   }
   if (url.pathname === "/ghost") return ghost(req, res, url);
   if (url.pathname === "/sync" && req.method === "POST") return sync(req, res);
+  if (url.pathname === "/account" && req.method === "POST") return account(req, res);
   if (url.pathname !== "/scores") return send(res, 404, { error: "Not found" });
 
   if (req.method === "GET") {
